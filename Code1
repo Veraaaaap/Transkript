@@ -1,0 +1,42 @@
+import speech_recognition as sr
+from datab import save_to_db
+
+def transcribe_audio(audio_file_path):
+    r = sr.Recognizer()
+    try:
+        with sr.AudioFile(audio_file_path) as source:
+            audio = r.record(source)  # Чтение всего файла
+
+    except FileNotFoundError:
+        print(f"Ошибка: Файл не найден: {audio_file_path}")
+        return None
+    except sr.UnknownValueError:
+        print("Не удалось распознать аудио")
+        return None
+    except sr.RequestError as e:
+        print(f"Не удалось получить результаты из сервиса распознавания: {e}")
+        return None
+    except Exception as e:
+        print(f"Другая ошибка: {e}")
+        return None
+
+    try:
+        text = r.recognize_google(audio, language="ru-RU")
+        return text
+    except sr.UnknownValueError:
+        print("Google Web Speech API: Не удалось распознать речь")
+        return None
+    except sr.RequestError as e:
+        print(f"Google Web Speech API: Не удалось получить результаты из сервиса распознавания; {e}")
+        return None
+
+if __name__ == "__main__":
+    audio_file = "C:/Users/Veraaap/Downloads/11.wav"  
+    transcribed_text = transcribe_audio(audio_file)
+
+    if transcribed_text:
+        print("Транскрибированный текст:")
+        print(transcribed_text)
+        save_to_db(transcribed_text)  
+    else:
+        print("Транскрибация не удалась")
