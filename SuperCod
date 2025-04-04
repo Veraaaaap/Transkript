@@ -1,0 +1,244 @@
+import sqlite3
+import os
+import subprocess
+import time
+from datetime import datetime
+import speech_recognition as sr
+import torch
+from transformers import pipeline
+import watchdog.events
+import watchdog.observers
+import logging
+from pydub import AudioSegment
+
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+
+AUDIO_FOLDER = "C:/Users/Veraaap/audio" # Путь к папке с аудио
+
+class CallRecorder:
+    def __init__(self):
+        self.db_file = 'calls.db'
+        self.conn = None
+        self._setup_db()
+
+    def _setup_db(self):
+        try:
+            self.conn = sqlite3.connect(self.db_file)
+            cursor = self.conn.execute("PRAGMA table_info(calls)")
+            columns = [column[1] for column in cursor.fetchall()]
+
+            if 'audio_file' not in columns:
+                self.conn.execute('ALTER TABLE calls ADD COLUMN audio_file TEXT')
+                self.conn.commit()
+
+            self.conn.execute('''
+                CREATE TABLE IF NOT EXISTS calls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time TEXT,
+                    duration INTEGER,
+                    topic TEXT,
+                    text TEXT,
+                    status TEXT,
+                    audio_file TEXT
+                )
+            ''')
+            self.conn.commit()
+        except sqlite3.Error as e:
+            print(f"Ошибка при настройке базы данных: {e}")
+            if self.conn:
+                self.conn.close() 
+            self.conn = sqlite3.connect(self.db_file)  
+            self.conn.execute('DROP TABLE IF EXISTS calls')
+            self._setup_db()
+
+    def save_call(self, call_data):
+        try:
+            self.conn.execute('''
+                INSERT INTO calls (
+                    time, duration,
+                    topic, text, status, audio_file
+                ) VALUES (?, ?, ?, ?, ?, ?)
+            ''', (
+                call_data.get('time', datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                call_data.get('duration', 0),
+                call_data.get('topic', ''),
+                call_data.get('text', ''),
+                call_data.get('status', 'processed'),
+                call_data.get('audio_file', '')
+            ))
+            self.conn.commit()
+            return True
+        except sqlite3.Error as e:
+            print(f"Ошибка сохранения: {e}")
+            return False
+
+    def open_db_browser(self):
+        db_path = os.path.abspath(self.db_file)
+        try:
+            if os.name == 'nt':
+                try:
+                    subprocess.Popen(['DB Browser for SQLite', db_path])
+                except FileNotFoundError:
+                    program_files = os.environ.get('ProgramFiles')
+                    db_browser_path = os.path.join(program_files, 'DB Browser for SQLite', 'DB Browser for SQLite.exe')
+                    if os.path.exists(db_browser_path):
+                        subprocess.Popen([db_browser_path, db_path])
+                    else:
+                        print("Установите DB Browser for SQLite с https://sqlitebrowser.org/")
+            elif os.name == 'posix':
+                subprocess.Popen(['open', '-a', 'DB Browser for SQLite', db_path])
+            else:
+                subprocess.Popen(['sqlitebrowser', db_path])
+        except Exception as e:
+            print(f"Не удалось открыть DB Browser: {e}")
+            print(f"Откройте файл вручную: {db_path}")
+
+    def close(self):
+         if self.conn:
+            self.conn.close()
+
+punctuation_model = None
+try:
+    punctuation_model = None
+except Exception as e:
+    logging.error(f"Ошибка при загрузке модели пунктуации: {e}")
+    punctuation_model = None
+
+def transcribe_audio(audio_file_path):
+    recorder = CallRecorder() 
+    r = sr.Recognizer()
+    temp_wav_file = None
+    try:
+        if audio_file_path.lower().endswith(".mp3"):
+            temp_wav_file = audio_file_path[:-4] + ".wav"
+            try:
+                sound = AudioSegment.from_mp3(audio_file_path)
+                sound.export(temp_wav_file, format="wav")
+                audio_file_path = temp_wav_file
+                logging.info(f"MP3 converted to WAV: {audio_file_path}")
+            except Exception as e:
+                logging.error(f"Error converting MP3 to WAV: {e}")
+                return False
+
+        with sr.AudioFile(audio_file_path) as source:
+            audio = r.record(source)
+
+        text = r.recognize_google(audio, language="ru-RU")
+        if not text:
+            logging.warning(f"Не удалось распознать текст в: {audio_file_path}")
+            recorder.close() 
+            return False
+
+        text_with_punctuation = text
+
+        call_data = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "text": text_with_punctuation,
+            "audio_file": audio_file_path,
+            "duration": int(len(audio.frame_data) / (audio.sample_rate * audio.sample_width)),
+            "topic": "",
+            "status": "processed"
+        }
+
+        if recorder.save_call(call_data):
+            logging.info(f"Сохранено в БД: {audio_file_path}")
+            result = True
+        else:
+            logging.error(f"Не удалось сохранить в БД: {audio_file_path}")
+            result = False
+
+    except FileNotFoundError:
+        logging.error(f"Ошибка: Файл не найден: {audio_file_path}")
+        result =  False
+    except sr.UnknownValueError:
+        logging.error(f"Не удалось распознать аудио: {audio_file_path}")
+        result = False
+    except sr.RequestError as e:
+        logging.error(f"Не удалось получить результаты из сервиса распознавания: {e}")
+        result = False
+    except Exception as e:
+        logging.exception(f"Другая ошибка при транскрибации {audio_file_path}: {e}")
+        result = False
+    finally:
+         if temp_wav_file and os.path.exists(temp_wav_file):
+            try:
+                os.remove(temp_wav_file)
+                logging.info(f"Deleted temporary WAV file: {temp_wav_file}")
+            except Exception as e:
+                logging.error(f"Error deleting temporary WAV file: {e}")
+         recorder.close()
+    return result
+
+def add_punctuation(text):
+    global punctuation_model
+    if punctuation_model is None:
+        logging.warning("Модель пунктуации не загружена. Возвращаю текст без пунктуации.")
+        return text
+
+    try:
+        result = punctuation_model(text, max_length=len(text) + 50)
+        return result[0]['generated_text']
+    except Exception as e:
+        logging.error(f"Ошибка при добавлении пунктуации: {e}")
+        return text
+
+class AudioFileHandler(watchdog.events.FileSystemEventHandler):
+    def __init__(self):
+        self.processed_files = set()
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+
+        filepath = event.src_path
+        if filepath.lower().endswith(('.mp3', '.flac')):
+            logging.info(f"Обнаружен новый файл: {filepath}")
+            time.sleep(2)
+            if filepath not in self.processed_files:
+                if os.path.exists(filepath):
+                    if transcribe_audio(filepath):
+                        self.processed_files.add(filepath)
+                        logging.info(f"Файл успешно обработан: {filepath}")
+                    else:
+                        logging.error(f"Не удалось обработать файл: {filepath}")
+                else:
+                    logging.warning(f"Файл больше не существует: {filepath}")
+            else:
+                logging.warning(f"Файл уже был обработан ранее: {filepath}")
+
+    def on_deleted(self, event):
+        if not event.is_directory and event.src_path in self.processed_files:
+            self.processed_files.remove(event.src_path)
+            logging.info(f"Файл удален из списка обработанных: {event.src_path}")
+
+def main():
+    recorder = CallRecorder()
+    recorder.open_db_browser()
+
+    event_handler = AudioFileHandler()
+
+    observer = watchdog.observers.Observer()
+    observer.schedule(event_handler, AUDIO_FOLDER, recursive=False)
+
+    observer.start()
+    logging.info(f"Наблюдение за папкой: {AUDIO_FOLDER}")
+
+    try:
+        while True:
+            time.sleep(1)
+            now = datetime.now()
+            if now.minute == 0 and now.second == 0: 
+                recorder.open_db_browser()
+
+    except KeyboardInterrupt:
+        logging.info("Получен сигнал прерывания, завершение работы...")
+    finally:
+        observer.stop()
+        observer.join()
+        recorder.close() 
+        logging.info("Программа завершена.")
+
+if __name__ == "__main__":
+    main()
